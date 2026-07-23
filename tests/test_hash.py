@@ -3,6 +3,7 @@
 # Distributed under the MIT license; see LICENSE in the project root.
 
 import hashlib
+import hmac
 import logging
 from datetime import UTC, datetime
 
@@ -16,8 +17,12 @@ from redcap_alert_handler.handlers.errors import PermanentError, TransientError
 from redcap_alert_handler.handlers.loader import resolve_handler
 
 
-def sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+# The salt the default info file (conftest.write_info) hands the handler.
+SALT = "SECRET-SALT-DO-NOT-LOG"
+
+
+def salted_hex(value: str, salt: str = SALT) -> str:
+    return hmac.new(salt.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # The registration goes through real importlib.metadata, so this only passes
@@ -39,12 +44,11 @@ def test_happy_path_posts_the_expected_form_and_completes(
     form = fake_redcap.last_form()
     assert form["content"] == "record"
     assert form["action"] == "import"
-    assert form["format"] == "csv"
+    assert form["format"] == "json"
     assert form["token"] == "SECRET-TOKEN-DO-NOT-LOG"
 
-    header, row = fake_redcap.last_csv_rows()
-    assert header == ["record_id", "value_hash"]
-    assert row == ["R-1001", sha256_hex("mrn-8675309")]
+    records = fake_redcap.last_json_records()
+    assert records == [{"record_id": "R-1001", "value_hash": salted_hex("mrn-8675309")}]
 
     assert read_completed_at(context.state_dir, message.internet_message_id) is not None
 
@@ -68,7 +72,7 @@ def test_logs_under_rah_hierarchy_and_never_logs_record_id_value_or_digest(
         text = record.getMessage()
         assert "R-1001" not in text
         assert "mrn-8675309" not in text
-        assert sha256_hex("mrn-8675309") not in text
+        assert salted_hex("mrn-8675309") not in text
 
 
 def test_same_message_processed_once(fake_redcap, make_config, make_context, make_message):
@@ -123,13 +127,13 @@ def test_dry_run_leaves_the_message_for_a_later_real_run(
     real_context = make_context(make_config())
     hash_field(message, real_context)
 
-    _, row = fake_redcap.last_csv_rows()
-    assert row == ["R-1001", sha256_hex("mrn-8675309")]
+    records = fake_redcap.last_json_records()
+    assert records == [{"record_id": "R-1001", "value_hash": salted_hex("mrn-8675309")}]
     assert fake_redcap.request_count == 1
     assert read_completed_at(real_context.state_dir, message.internet_message_id) is not None
 
 
-def test_dry_run_logs_target_but_no_participant_data(
+def test_dry_run_logs_the_import_payload_but_not_the_raw_value(
     fake_redcap, make_config, make_context, make_message, caplog
 ):
     context = make_context(make_config(dry_run=True))
@@ -145,11 +149,13 @@ def test_dry_run_logs_target_but_no_participant_data(
     ]
     assert ours
     joined = " ".join(record.getMessage() for record in ours)
+    # The dry run shows exactly what a real run would import: the target url
+    # and the full JSON payload, record id and salted digest both.
     assert "https://redcap.example.edu/api/" in joined
-    assert "value_hash" in joined
-    assert "R-1001" not in joined
+    assert "R-1001" in joined
+    assert salted_hex("mrn-8675309") in joined
+    # The raw value is the sensitive part, and it never appears -- only its hash.
     assert "mrn-8675309" not in joined
-    assert sha256_hex("mrn-8675309") not in joined
 
 
 def test_non_bool_dry_run_is_permanent(fake_redcap, make_config, make_context, make_message):
@@ -176,8 +182,8 @@ def test_timeout_retry_completes_on_the_same_message(
     fake_redcap.respond_ok()
     hash_field(message, context)
 
-    header, row = fake_redcap.last_csv_rows()
-    assert row[1] == sha256_hex("mrn-8675309")
+    records = fake_redcap.last_json_records()
+    assert records[0]["value_hash"] == salted_hex("mrn-8675309")
     assert read_completed_at(context.state_dir, message.internet_message_id) is not None
 
 
@@ -306,3 +312,42 @@ def test_info_file_missing_token_is_permanent(
         hash_field(make_message(), context)
 
     assert "token" in str(exc_info.value)
+
+
+def test_info_file_missing_salt_is_permanent_and_leaks_no_salt(
+    fake_redcap, make_config, make_context, make_message, write_info
+):
+    # Without a salt the digest is a bare, reversible hash, so a missing salt
+    # is a hard stop rather than a quiet fallback.
+    info_path = write_info(
+        {
+            "url": "https://redcap.example.edu/api/",
+            "token": "SECRET-TOKEN-DO-NOT-LOG",
+        }
+    )
+    context = make_context(make_config(info_path=info_path))
+
+    with pytest.raises(PermanentError) as exc_info:
+        hash_field(make_message(), context)
+
+    assert "salt" in str(exc_info.value)
+    assert fake_redcap.request_count == 0
+
+
+def test_salt_keys_the_digest(fake_redcap, make_config, make_context, make_message, write_info):
+    # The salt has to actually key the hash: the same value under a different
+    # salt is a different digest. Guards against the salt dropping out.
+    info_path = write_info(
+        {
+            "url": "https://redcap.example.edu/api/",
+            "token": "SECRET-TOKEN-DO-NOT-LOG",
+            "salt": "a-particular-salt",
+        }
+    )
+    context = make_context(make_config(info_path=info_path))
+
+    hash_field(make_message(value="mrn-8675309"), context)
+
+    digest = fake_redcap.last_json_records()[0]["value_hash"]
+    assert digest == salted_hex("mrn-8675309", "a-particular-salt")
+    assert digest != salted_hex("mrn-8675309", "a-different-salt")

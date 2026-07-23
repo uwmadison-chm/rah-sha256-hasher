@@ -5,22 +5,30 @@
 """The hash_field handler: SHA-256 one field from the alert, write it to REDCap.
 
 Each alert names one record and one value in its TOML body. The handler takes
-the SHA-256 of the value (UTF-8, lowercase hex) and imports that digest into
-`hashed_value_field` for the named record through the REDCap API. This is the
-kind of thing REDCap can't do on its own -- a worked example that wires an
-alert all the way through to a record write.
+the HMAC-SHA-256 of the value, keyed on a salt from the info file (UTF-8,
+lowercase hex), and imports that digest into `hashed_value_field` for the
+named record through the REDCap API. The salt is what makes the digest a real
+de-identifier: without it, an unsalted hash of a low-entropy value like an MRN
+walks straight back to the value. This is the kind of thing REDCap can't do on
+its own -- a worked example that wires an alert all the way through to a
+record write.
 
-Nothing here logs a record id, the value, or the digest: the value comes from
-a participant's record, so a hash of it is participant-adjacent too, and the
-log lines carry only the message's internet id and what happened. The logger
-comes from rah's `get_logger`, so those lines land in rah's own output
-instead of an unconfigured hierarchy nobody sees. REDCap's own error text can
-go into a `PermanentError` message, but the API token never does.
+A normal run's log lines carry only the message's internet id and what
+happened. The value comes from a participant's record, so it never gets
+logged at all; the digest is keyed on the secret salt, so it can't be walked
+back to the value, but there's no reason to print it on every message either.
+The logger comes from rah's `get_logger`, so those lines land in rah's own
+output instead of an unconfigured hierarchy nobody sees. A dry run is the
+exception: it logs the whole JSON payload it would import, record id and
+digest both, so you can see what a real run would write -- the raw value
+still never appears. REDCap's own error text can go into a `PermanentError`
+message, but the API token and the salt never do.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import tomllib
 from collections.abc import Mapping
@@ -56,6 +64,7 @@ class _HandlerConfig:
 class _RedcapInfo:
     url: str
     token: str
+    salt: str
 
 
 def _build_client() -> httpx.Client:
@@ -142,7 +151,12 @@ def _read_info(path_str: str) -> _RedcapInfo:
     if not isinstance(token, str) or not token.strip():
         # Never put the token in an error; only its absence is reportable.
         raise PermanentError(f"redcap_info_file {path_str!r} has no string 'token'")
-    return _RedcapInfo(url=url, token=token)
+    salt = data.get("salt")
+    if not isinstance(salt, str) or not salt.strip():
+        # The salt keys the digest, so it's as much a secret as the token:
+        # only its absence is reportable, never its value.
+        raise PermanentError(f"redcap_info_file {path_str!r} has no string 'salt'")
+    return _RedcapInfo(url=url, token=token, salt=salt)
 
 
 def _redcap_error_detail(response: httpx.Response) -> str:
@@ -193,22 +207,25 @@ def hash_field(message: Message, context: Context) -> None:
 
     Reads its route's config (see the README for the keys), pulls `id` and
     `value` from the TOML body, claims the message in the store, and imports
-    `sha256(value)` into `hashed_value_field` for record `id`. A message the
+    the salt-keyed HMAC-SHA-256 of `value` into `hashed_value_field` for
+    record `id`. A message the
     store already has marked complete returns without an import. A REDCap
     timeout raises `TransientError` so the message retries; every other
     failure raises `PermanentError`.
 
     With `dry_run = true` on the route, it does everything up to the import --
-    parse the body, read the info file, compute the digest -- then logs where
-    it would have written and returns without calling REDCap or touching the
-    store. rah writes nothing back for a dry-run message, so it stays in place;
-    there's no separate signal to raise.
+    parse the body, read the info file, compute the digest -- then logs the
+    JSON payload it would have imported and returns without calling REDCap or
+    touching the store. rah writes nothing back for a dry-run message, so it
+    stays in place; there's no separate signal to raise.
     """
     try:
         config = _read_config(context.config)
         record_id, value = _read_body(message.body_text)
         info = _read_info(config.redcap_info_file)
-        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        digest = hmac.new(
+            info.salt.encode("utf-8"), value.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
 
         json_data = json.dumps(
             [{
@@ -219,9 +236,10 @@ def hash_field(message: Message, context: Context) -> None:
         logger.debug(f"Built JSON data: {json_data}")
         if config.dry_run:
             logger.info(
-                "hash_field: dry run for %s -- would import to %s; REDCap not called",
+                "hash_field: dry run for %s -- would import to %s: %s; REDCap not called",
                 message.internet_message_id,
                 info.url,
+                json_data,
             )
             return
 

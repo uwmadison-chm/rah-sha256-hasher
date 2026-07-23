@@ -2,8 +2,7 @@
 # Copyright (c) Board of Regents of the University of Wisconsin System
 # Distributed under the MIT license; see LICENSE in the project root.
 
-import csv
-import io
+import json
 import sqlite3
 import urllib.parse
 from datetime import UTC, datetime
@@ -24,7 +23,7 @@ class FakeRedcap:
 
     A test picks one of the `respond_*` / `raise_*` modes, runs the handler,
     and then reads back the requests it saw to check the form fields and the
-    CSV that were posted.
+    JSON that was posted.
     """
 
     def __init__(self) -> None:
@@ -76,9 +75,8 @@ class FakeRedcap:
         request = self.requests[-1]
         return dict(urllib.parse.parse_qsl(request.content.decode()))
 
-    def last_csv_rows(self) -> list[list[str]]:
-        data = self.last_form()["data"]
-        return list(csv.reader(io.StringIO(data)))
+    def last_json_records(self) -> list[dict[str, str]]:
+        return json.loads(self.last_form()["data"])
 
 
 @pytest.fixture
@@ -101,6 +99,7 @@ def write_info(tmp_path):
             contents = {
                 "url": "https://redcap.example.edu/api/",
                 "token": "SECRET-TOKEN-DO-NOT-LOG",
+                "salt": "SECRET-SALT-DO-NOT-LOG",
             }
         path = tmp_path / "redcap_info.toml"
         lines = [f'{key} = "{value}"' for key, value in contents.items()]

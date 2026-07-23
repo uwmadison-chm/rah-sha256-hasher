@@ -20,9 +20,9 @@ go into a `PermanentError` message, but the API token never does.
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import io
+import json
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -146,14 +146,6 @@ def _read_info(path_str: str) -> _RedcapInfo:
     return _RedcapInfo(url=url, token=token)
 
 
-def _build_csv(config: _HandlerConfig, record_id: str, digest: str) -> str:
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow([config.redcap_id_field, config.hashed_value_field])
-    writer.writerow([record_id, digest])
-    return buffer.getvalue()
-
-
 def _redcap_error_detail(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -164,17 +156,16 @@ def _redcap_error_detail(response: httpx.Response) -> str:
     return response.text[:500]
 
 
-def _import_record(info: _RedcapInfo, csv_data: str) -> None:
+def _import_record(info: _RedcapInfo, json_data: str) -> None:
     form = {
         "token": info.token,
         "content": "record",
         "action": "import",
-        "format": "csv",
-        "type": "flat",
+        "format": "json",
         "overwriteBehavior": "normal",
         "forceAutoNumber": "false",
         "returnContent": "count",
-        "data": csv_data,
+        "data": json_data,
     }
     try:
         with _build_client() as client:
@@ -220,22 +211,27 @@ def hash_field(message: Message, context: Context) -> None:
         info = _read_info(config.redcap_info_file)
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+        json_data = json.dumps(
+            {
+                config.redcap_id_field: record_id,
+                config.hashed_value_field: digest
+            }
+        )
         if config.dry_run:
             logger.info(
-                "hash_field: dry run for %s -- would import to %s, field %r; REDCap not called",
+                "hash_field: dry run for %s -- would import to %s: %s; REDCap not called",
                 message.internet_message_id,
                 info.url,
-                config.hashed_value_field,
+                json_data
             )
             return
 
-        csv_data = _build_csv(config, record_id, digest)
         db_path = context.state_dir / "processed.sqlite3"
         if store.claim(db_path, message.internet_message_id):
             logger.info("hash_field: %s already processed, skipping", message.internet_message_id)
             return
 
-        _import_record(info, csv_data)
+        _import_record(info, json_data)
         store.mark_completed(db_path, message.internet_message_id)
         logger.info("hash_field: hashed one field for %s", message.internet_message_id)
     except HandlerError:

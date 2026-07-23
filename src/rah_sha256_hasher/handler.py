@@ -211,10 +211,10 @@ def hash_field(message: Message, context: Context) -> None:
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
 
         json_data = json.dumps(
-            {
+            [{
                 config.redcap_id_field: record_id,
                 config.hashed_value_field: digest
-            }
+            }]
         )
         logger.debug(f"Built JSON data: {json_data}")
         if config.dry_run:

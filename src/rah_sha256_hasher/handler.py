@@ -21,7 +21,6 @@ go into a `PermanentError` message, but the API token never does.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import tomllib
 from collections.abc import Mapping
@@ -217,12 +216,12 @@ def hash_field(message: Message, context: Context) -> None:
                 config.hashed_value_field: digest
             }
         )
+        logger.debug(f"Built JSON data: {json_data}")
         if config.dry_run:
             logger.info(
-                "hash_field: dry run for %s -- would import to %s: %s; REDCap not called",
+                "hash_field: dry run for %s -- would import to %s; REDCap not called",
                 message.internet_message_id,
                 info.url,
-                json_data
             )
             return
 

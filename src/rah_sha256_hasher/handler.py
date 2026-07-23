@@ -189,8 +189,8 @@ def _import_record(info: _RedcapInfo, csv_data: str) -> None:
         raise PermanentError(f"REDCap returned HTTP {response.status_code}: {detail}")
 
     try:
+        logger.debug(f"REDCap response: {response.text}")
         payload = response.json()
-        logger.debug(f"REDCap response: {payload}")
     except ValueError as e:
         raise PermanentError(f"REDCap response was not JSON: {response.text[:500]}") from e
     count = payload.get("count") if isinstance(payload, dict) else None
